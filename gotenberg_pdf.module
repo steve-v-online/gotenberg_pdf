@@ -1,0 +1,140 @@
+<?php
+
+/**
+ * @file
+ * Generates PDFs of publicly accessible node pages using Gotenberg.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function gotenberg_pdf_menu() {
+  $items['pdf/%node'] = array(
+    'title' => 'Download PDF',
+    'page callback' => 'gotenberg_pdf_download',
+    'page arguments' => array(1),
+    'access callback' => 'node_access',
+    'access arguments' => array('view', 1),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/user-interface/gotenberg-pdf'] = array(
+    'title' => 'Gotenberg PDF',
+    'description' => 'Configure the Gotenberg PDF options.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => array('gotenberg_pdf_admin'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'gotenberg_pdf.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Converts a node page to a PDF and sends it as a download.
+ */
+function gotenberg_pdf_download($node) {
+  backdrop_page_is_cacheable(FALSE);
+  backdrop_add_http_header('Cache-Control', 'private, no-store');
+
+  // Gotenberg fetches the page without the current user's session.
+  if (!node_access('view', $node, backdrop_anonymous_user())) {
+    return MENU_ACCESS_DENIED;
+  }
+
+  $config = config('gotenberg_pdf.settings');
+
+  $page_url = url($config->get('path') . '/' . $node->nid, array(
+    'absolute' => TRUE,
+  ));
+
+  $boundary = 'backdrop-' . backdrop_random_key(16);
+  $fields = array(
+    'url' => $page_url,
+    'scale' => $config->get('scale'),
+    'singlePage' => $config->get('single_page') ? 'true' : 'false',
+    'marginTop' => $config->get('margin_top'),
+    'marginBottom' => $config->get('margin_bottom'),
+    'marginLeft' => $config->get('margin_left'),
+    'marginRight' => $config->get('margin_right'),
+    // Tell Gotenberg not to turn an HTTP error page into a successful PDF.
+    'failOnHttpStatusCodes' => json_encode(range(400, 599)),
+  );
+
+  $body = '';
+  foreach ($fields as $name => $value) {
+    $body .= '--' . $boundary . "\r\n";
+    $body .= 'Content-Disposition: form-data; name="' . $name . "\"\r\n\r\n";
+    $body .= $value . "\r\n";
+  }
+  $body .= '--' . $boundary . "--\r\n";
+
+  $response = backdrop_http_request(
+    $config->get('gotenberg_host') . $config->get('gotenberg_endpoint'),
+    array(
+      'method' => 'POST',
+      'headers' => array(
+        'Content-Type' => 'multipart/form-data; boundary=' . $boundary,
+      ),
+      'data' => $body,
+      'timeout' => $config->get('api_timeout'),
+      'max_redirects' => 0,
+    )
+  );
+
+  if (!isset($response->code)
+    || (int) $response->code !== 200
+    || !isset($response->data)
+    || strncmp($response->data, '%PDF-', 5) !== 0) {
+    $code = $response->code ?? 'unknown';
+    $error = $response->error ?? 'Invalid or empty PDF response';
+
+    watchdog(
+      'gotenberg_pdf',
+      'PDF generation failed for node @nid. HTTP status: @code. Error: @error',
+      array(
+        '@nid' => $node->nid,
+        '@code' => $code,
+        '@error' => $error,
+      ),
+      WATCHDOG_ERROR
+    );
+
+    backdrop_add_http_header('Status', '502 Bad Gateway');
+    backdrop_set_message(t('Unable to generate the PDF. Please try again later.'), 'warning');
+    backdrop_goto('node/' . $node->nid);
+  }
+
+  $pattern = $config->get('filename_pattern') ?: 'node-[node:nid].pdf';
+
+  $filename = token_replace($pattern, array('node' => $node), array(
+    'clear' => TRUE,
+    'sanitize' => FALSE,
+  ));
+
+  // Restrict the filename to safe ASCII characters for the response header.
+  $filename = preg_replace('/[^A-Za-z0-9._-]+/', '-', $filename);
+  $filename = trim($filename, '.-_');
+
+  // Remove duplicate instances of dashes in the filename.
+  $filename = preg_replace('/-+/', '-', $filename);
+
+  // Allow an administrator to include .pdf without adding it twice.
+  $filename = preg_replace('/\.pdf$/i', '', $filename);
+  $filename = trim($filename, '.-_');
+
+  if ($filename === '') {
+    $filename = 'node-' . $node->nid;
+  }
+
+  backdrop_add_http_header('Content-Type', 'application/pdf');
+  backdrop_add_http_header('Content-Disposition', 'attachment; filename="' . $filename . '.pdf"');
+  backdrop_add_http_header('X-Content-Type-Options', 'nosniff');
+
+  if ($_SERVER['REQUEST_METHOD'] !== 'HEAD') {
+    print $response->data;
+  }
+
+  backdrop_exit();
+}

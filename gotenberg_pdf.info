@@ -1,0 +1,6 @@
+name = Gotenberg PDF
+description = Downloads node pages as PDFs using Gotenberg.
+type = module
+backdrop = 1.x
+version = 1.x-1.0.0
+dependencies[] = node
